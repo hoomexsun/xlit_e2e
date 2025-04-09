@@ -1,117 +1,126 @@
-import torch
-import random
-import numpy as np
-import logging
-import json
 from pathlib import Path
-from torch import nn, optim
-from torch.utils.data import DataLoader, random_split
-from model import Seq2Seq
-from dataset import TransliterationDataset, load_data
-from tokenizer import CharTokenizer
-from checkpoint.save import CheckpointManager
-from utils import set_seed, setup_logging, evaluate, plot_loss
+
+from matplotlib import pyplot as plt
+from torch import nn
+import torch
+
+from dataset import load_dataloaders
+from models.seq2seq import Seq2Seq
+from tokenizers import build_tokenizer
+from utils.loader import load_data, load_yaml
 
 
-def train_loop(
-    data_path: Path,
-    exp_dir: Path,
-    seed=42,
-    embed_dim=64,
-    hidden_dim=128,
-    num_layers=2,
-    dropout=0.5,
-    batch_size=32,
-    learning_rate=0.001,
-    epochs=50,
-    keep_nbest_models=5,
-):
-    set_seed(seed)
-    log_dir = exp_dir / "log"
-    image_dir = exp_dir / "images"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    image_dir.mkdir(parents=True, exist_ok=True)
-    setup_logging(log_dir)
+# 1. Load data
+PARAMS_FILE = "data/params.yaml"
+xs, ys, params = load_data("data/transcribed.txt", params_file=PARAMS_FILE)
 
-    x_data, y_data = load_data(data_path)
-    x_vocab = set("".join(x_data))
-    y_vocab = set("".join(y_data))
-    max_len = max(max(map(len, x_data)), max(map(len, y_data))) + 2
+# 2. Get parameters
+# Uncomment to load from file instead
+# params = load_yaml(PARAMS_FILE)
+BATCH_SIZE = params["batch_size"]
+EMBED_DIM = params["embed_dim"]
+HIDDEN_DIM = params["hidden_dim"]
+MAX_LEN = params["max_len"]
+X_VOCAB = params["x_vocab"]
+Y_VOCAB = params["y_vocab"]
 
-    config = {
-        "x_vocab": list(x_vocab),
-        "y_vocab": list(y_vocab),
-        "max_len": max_len,
-        "embed_dim": embed_dim,
-        "hidden_dim": hidden_dim,
-        "num_layers": num_layers,
-        "dropout": dropout,
-    }
-    (Path("data") / "config.json").write_text(
-        json.dumps(config, indent=2), encoding="utf-8"
-    )
+xlit_dict = load_yaml("conf/train.yaml")
+model_name = xlit_dict["xlit"]
+xlit_conf = xlit_dict["xlit_conf"]
+ENCODER_LAYERS = xlit_conf["encoder_layers"]
+DECODER_LAYERS = xlit_conf["decoder_layers"]
+DROPOUT_RATE = xlit_conf["dropout_rate"]
+LR = xlit_conf["optim_conf"]["lr"]
+MAX_EPOCH = xlit_conf["max_epoch"]
 
-    x_tokenizer = CharTokenizer(x_vocab)
-    y_tokenizer = CharTokenizer(y_vocab)
+# 3. Tokenizer
+token_type = "char"
+lang1 = "ben"
+lang2 = "mni"
 
-    dataset = TransliterationDataset(x_data, y_data, x_tokenizer, y_tokenizer, max_len)
-    train_size = int(0.8 * len(dataset))
-    train_dataset, valid_dataset = random_split(
-        dataset, [train_size, len(dataset) - train_size]
-    )
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=batch_size)
+x_tokenizer = build_tokenizer(xs, token_type, lang1)
+y_tokenizer = build_tokenizer(ys, token_type, lang2)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = Seq2Seq(
-        input_dim=len(x_tokenizer.char2idx),
-        output_dim=len(y_tokenizer.char2idx),
-        embed_dim=embed_dim,
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
-        dropout=dropout,
-        device=device,
-    ).to(device)
+# 4. DataLoader
+train_dataloader, val_dataloader = load_dataloaders(
+    xs,
+    ys,
+    x_tokenizer,
+    y_tokenizer,
+    max_len=MAX_LEN,
+    batch_size=BATCH_SIZE,
+    val_ratio=0.2,
+)
 
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.CrossEntropyLoss()
+## Print DataLoader Information
+print(f"{BATCH_SIZE=}")
+print(f"Size of train dataloader: {len(train_dataloader)}")
+print(f"Size of validation dataloader: {len(val_dataloader)}")
 
-    checkpoint_manager = CheckpointManager(exp_dir, keep_nbest_models)
-    last_epoch = checkpoint_manager.load_if_available(model, optimizer)
+# 5. Model, optimizer and criterion
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = Seq2Seq(
+    len(x_tokenizer.tok2idx),
+    len(y_tokenizer.tok2idx),
+    EMBED_DIM,
+    HIDDEN_DIM,
+    ENCODER_LAYERS,
+    DROPOUT_RATE,
+    DEVICE,
+)
+optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+criterion = nn.CrossEntropyLoss()
 
-    best_valid_loss = float("inf")
-    train_losses = []
-    valid_losses = []
+## Print model Summary
+print(model)
+total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Total trainable parameters: {total_params}")
 
-    for epoch in range(last_epoch + 1, epochs + 1):
-        model.train()
-        epoch_loss = 0
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
-            output = model(x, y)
-            loss = criterion(
-                output[:, 1:].reshape(-1, output.shape[2]), y[:, 1:].reshape(-1)
-            )
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
 
-        avg_train_loss = epoch_loss / len(train_loader)
-        avg_valid_loss = evaluate(model, valid_loader, criterion, device)
-
-        train_losses.append(avg_train_loss)
-        valid_losses.append(avg_valid_loss)
-
-        logging.info(
-            f"Epoch {epoch} - Train Loss: {avg_train_loss:.4f}, Valid Loss: {avg_valid_loss:.4f}"
+# 6. Training Loop
+EXP_DIR = f"exp/{model_name}_{token_type}_{lang1}_{lang2}"
+Path(EXP_DIR).mkdir(exist_ok=True)
+train_losses = []
+for epoch in range(1, MAX_EPOCH + 1):
+    model.train()
+    epoch_loss = 0
+    for x, y in train_dataloader:
+        x, y = x.to(DEVICE), y.to(DEVICE)
+        optimizer.zero_grad()
+        y_pred = model(
+            x,
+            max_len=MAX_LEN,
+            sos_token=y_tokenizer.tok2idx["<sos>"],
+            eos_token=y_tokenizer.tok2idx["<eos>"],
         )
-        checkpoint_manager.save(model, optimizer, epoch, avg_train_loss, avg_valid_loss)
+        loss = criterion(
+            y_pred[:, 1:].reshape(-1, y_pred.shape[2]), y[:, 1:].reshape(-1)
+        )
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+    train_losses.append(epoch_loss / len(train_dataloader))
+    print(f"Epoch {epoch}, Loss: {epoch_loss:.4f}")
 
-        if avg_valid_loss < best_valid_loss:
-            best_valid_loss = avg_valid_loss
-            logging.info(f"New best valid loss: {best_valid_loss:.4f}")
+    # Save model every 10th epoch
+    if epoch % 10 == 0:
+        torch.save(model.state_dict(), f"{EXP_DIR}/epoch_{epoch}.pth")
 
-        if epoch % 10 == 0:
-            plot_path = image_dir / f"loss_epoch_{epoch}.png"
-            plot_loss(train_losses, plot_path)
+
+# Plot
+plt.plot(train_losses, label="Train Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.show()
+
+
+## Inference
+
+# model.eval()
+# with torch.inference_mode():
+#     x = ...
+#     x = x.to(DEVICE)
+#     predictions = model(x.to(DEVICE), y=None, max_len=MAX_LEN)
+
+#     pred_ids = predictions.argmax(dim=2)

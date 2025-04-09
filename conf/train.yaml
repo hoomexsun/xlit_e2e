@@ -1,0 +1,26 @@
+xlit: seq2seq
+xlit_conf:
+  embed_dim: 30
+  encoder_layers: 2
+  decoder_layers: 2
+  hidden_dim: 100
+  dropout_rate: 0.5
+  attn_dim: 100
+  ## INPUT SETTING
+  max_len: 100
+  ## OPTIMIZER SETTING
+  optim: adam
+  optim_conf:
+    lr: 1.0e-02
+  ## OTHER TRAINING SETTING
+  max_epoch: 200
+  batch_size: 32
+  keep_nbest_models: 5
+  seed: 248
+  best_model_criterion:
+    - - valid
+      - loss
+      - min
+    - - train
+      - loss
+      - min

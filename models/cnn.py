@@ -1,0 +1,2 @@
+class CNNModel:
+    pass
